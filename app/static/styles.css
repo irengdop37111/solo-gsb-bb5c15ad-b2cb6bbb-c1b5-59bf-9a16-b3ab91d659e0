@@ -136,6 +136,20 @@ button.danger:hover { background: #991b1b; }
 .reason { font-size: 12.5px; color: var(--red); margin-top: 6px; }
 .reason.ok { color: var(--green); }
 
+/* 认领信息 */
+.claim-box {
+  margin-top: 8px;
+  font-size: 13px;
+  border-radius: 8px;
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.claim-box.other { background: var(--amber-bg); color: var(--amber); }
+.claim-box.mine { background: var(--green-bg); color: var(--green); }
+
 textarea, input[type=text], input[type=password], select {
   width: 100%;
   border: 1px solid var(--line);

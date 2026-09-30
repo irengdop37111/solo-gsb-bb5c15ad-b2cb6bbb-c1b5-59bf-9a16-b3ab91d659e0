@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -48,6 +49,15 @@ class TranslationBody(BaseModel):
 class ConfirmBody(BaseModel):
     source_rev: int
     trans_rev: int
+
+
+class ClaimBody(BaseModel):
+    source_rev: int  # 读取时的原文修订号
+    trans_rev: int   # 读取时的译文修订号
+
+
+# 认领有效期：30 分钟
+CLAIM_TTL = timedelta(minutes=30)
 
 
 class WithdrawBody(BaseModel):
@@ -223,6 +233,8 @@ def update_label(label_id: int, body: LabelBody, user: dict = Depends(require_ro
             "WHERE label_id = ? AND confirmed = 1",
             (label_id,),
         )
+        # 原文修订：该展签所有语言的认领一律失效
+        conn.execute("DELETE FROM claims WHERE label_id = ?", (label_id,))
         conn.commit()
         new_row = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
     return dict(new_row)
@@ -272,6 +284,8 @@ def withdraw_label(
             "UPDATE translations SET public_hidden = 1 WHERE label_id = ?",
             (label_id,),
         )
+        # 撤展：该展签所有语言的认领一律失效
+        conn.execute("DELETE FROM claims WHERE label_id = ?", (label_id,))
         conn.commit()
         new_row = _get_label_with_names(conn, label_id)
     return dict(new_row)
@@ -313,6 +327,8 @@ def restore_label(
             "UPDATE translations SET confirmed = 0, confirmer_id = NULL WHERE label_id = ?",
             (label_id,),
         )
+        # 复展：认领上下文（撤展状态）已变化，相关认领一律失效
+        conn.execute("DELETE FROM claims WHERE label_id = ?", (label_id,))
         conn.commit()
         new_row = _get_label_with_names(conn, label_id)
     return dict(new_row)
@@ -371,6 +387,17 @@ def build_board(conn, language_id: int) -> dict:
     ).fetchall()
     trans_map = {t["label_id"]: dict(t) for t in trans_rows}
 
+    # 当前仍有效（未到期）的认领；到期行不展示，他人可直接接手
+    claim_rows = conn.execute(
+        "SELECT c.id, c.label_id, c.language_id, c.claimer_id, "
+        "       u.display_name AS claimer_name, u.username AS claimer_username, "
+        "       c.source_rev, c.trans_rev, c.claimed_at, c.expires_at "
+        "FROM claims c JOIN users u ON u.id = c.claimer_id "
+        "WHERE c.language_id = ? AND c.expires_at > ?",
+        (language_id, now()),
+    ).fetchall()
+    claim_map = {c["label_id"]: dict(c) for c in claim_rows}
+
     items = []
     withdrawn_items = []
     counts = {"missing": 0, "pending": 0, "stale": 0, "ready": 0}
@@ -403,6 +430,7 @@ def build_board(conn, language_id: int) -> dict:
             "translation": t,
             "status": status,
             "reason": reason,
+            "claim": claim_map.get(label["id"]),
         })
 
     total = len(items)
@@ -520,6 +548,11 @@ def submit_translation_for_label(
                 (label_id, language_id, body.text.strip(), label["source_rev"],
                  user["id"], now()),
             )
+        # 译文已提交/修订：原认领所基于的修订号已变化，一律失效
+        conn.execute(
+            "DELETE FROM claims WHERE label_id = ? AND language_id = ?",
+            (label_id, language_id),
+        )
         conn.commit()
         t = conn.execute(
             "SELECT * FROM translations WHERE label_id = ? AND language_id = ?",
@@ -558,9 +591,28 @@ def confirm_translation(
         if t["translator_id"] == user["id"]:
             raise HTTPException(403, "同一账号不得确认自己提交的译文")
 
+        # 认领校验：该译文若被他人有效认领，其他账号一律拒绝确认
+        claim = conn.execute(
+            "SELECT c.*, u.display_name AS claimer_name FROM claims c "
+            "JOIN users u ON u.id = c.claimer_id "
+            "WHERE c.label_id = ? AND c.language_id = ? AND c.expires_at > ?",
+            (label_id, language_id, now()),
+        ).fetchone()
+        if claim and claim["claimer_id"] != user["id"]:
+            raise HTTPException(
+                409,
+                f"该译文已被 {claim['claimer_name']} 认领（到期时间 {claim['expires_at']} UTC），"
+                "认领到期或被释放前请由认领人校对确认",
+            )
+
         conn.execute(
             "UPDATE translations SET confirmed = 1, confirmer_id = ?, updated_at = ? WHERE id = ?",
             (user["id"], now(), t["id"]),
+        )
+        # 成功确认结束认领
+        conn.execute(
+            "DELETE FROM claims WHERE label_id = ? AND language_id = ?",
+            (label_id, language_id),
         )
         conn.commit()
         t = conn.execute(
@@ -569,6 +621,124 @@ def confirm_translation(
             (t["id"],),
         ).fetchone()
     return dict(t)
+
+
+# ---------------------------- 待审译文认领 / 释放 ----------------------------
+
+
+def _get_active_claim(conn, language_id: int, label_id: int):
+    """取该（语言, 展签）当前仍有效的认领；到期行视为不存在。"""
+    return conn.execute(
+        "SELECT c.*, u.display_name AS claimer_name, u.username AS claimer_username "
+        "FROM claims c JOIN users u ON u.id = c.claimer_id "
+        "WHERE c.label_id = ? AND c.language_id = ? AND c.expires_at > ?",
+        (label_id, language_id, now()),
+    ).fetchone()
+
+
+@app.post("/api/board/{language_id}/labels/{label_id}/claim")
+def claim_translation(
+    language_id: int, label_id: int, body: ClaimBody,
+    user: dict = Depends(require_roles("translator", "reviewer")),
+):
+    """认领一条待审译文 30 分钟，凭展签、语言及读取时的原文/译文修订号。
+
+    - 提交该译文的账号不得认领（403）；
+    - 已撤展 / 已确认 / 过期版本（原文或译文修订号不匹配）一律 409 拒绝，状态不变；
+    - 他人有效认领中 → 409；自己已有效认领 → 幂等返回原认领；
+    - 认领到期或已释放（含因修订/撤展失效）→ 接手成功；同一译文同一时刻仅一条有效认领。
+    """
+    with db._write_lock, get_conn() as conn:
+        label = conn.execute("SELECT * FROM labels WHERE id = ?", (label_id,)).fetchone()
+        if not label:
+            raise HTTPException(404, "展签不存在")
+        if not conn.execute(
+            "SELECT 1 FROM languages WHERE id = ?", (language_id,)
+        ).fetchone():
+            raise HTTPException(404, "语言不存在")
+        if label["status"] == "withdrawn":
+            raise HTTPException(409, "该展签已撤展，不能认领译文")
+        t = conn.execute(
+            "SELECT * FROM translations WHERE label_id = ? AND language_id = ?",
+            (label_id, language_id),
+        ).fetchone()
+        if not t:
+            raise HTTPException(404, "尚无译文，无法认领")
+        if body.source_rev != label["source_rev"]:
+            raise HTTPException(409, "原文已有新版本，该译文已过期，不能认领过期版本")
+        if body.trans_rev != t["trans_rev"]:
+            raise HTTPException(
+                409,
+                f"译文已被更新（当前译文修订号 {t['trans_rev']}，"
+                f"你认领请求基于 {body.trans_rev}），请刷新后重试",
+            )
+        if t["source_rev_at_edit"] != label["source_rev"]:
+            raise HTTPException(409, "译文基于旧版原文（过期），不能认领")
+        if t["confirmed"]:
+            raise HTTPException(409, "该译文已确认，无需认领")
+        if t["translator_id"] == user["id"]:
+            raise HTTPException(403, "提交该译文的账号不得认领，请由其他译者/校对认领校对")
+
+        active = _get_active_claim(conn, language_id, label_id)
+        if active:
+            if active["claimer_id"] == user["id"]:
+                # 幂等：重复认领自己仍有效持有的认领，直接返回
+                return dict(_get_active_claim(conn, language_id, label_id))
+            raise HTTPException(
+                409,
+                f"该译文已被 {active['claimer_name']} 认领"
+                f"（到期时间 {active['expires_at']} UTC），"
+                "到期前不能重复认领；到期后可接手",
+            )
+
+        # 无有效认领（含已到期的陈旧行）：清理陈旧行后写入新认领
+        conn.execute(
+            "DELETE FROM claims WHERE label_id = ? AND language_id = ?",
+            (label_id, language_id),
+        )
+        claimed_at = datetime.now(timezone.utc)
+        expires_at = claimed_at + CLAIM_TTL
+        claimed_s = claimed_at.strftime("%Y-%m-%d %H:%M:%S")
+        expires_s = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        cur = conn.execute(
+            "INSERT INTO claims (language_id, label_id, claimer_id, source_rev, "
+            "trans_rev, claimed_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+            (language_id, label_id, user["id"], body.source_rev, body.trans_rev,
+             claimed_s, expires_s),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT c.*, u.display_name AS claimer_name, u.username AS claimer_username "
+            "FROM claims c JOIN users u ON u.id = c.claimer_id WHERE c.id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+    return dict(row)
+
+
+@app.post("/api/board/{language_id}/labels/{label_id}/claim/release")
+def release_claim(
+    language_id: int, label_id: int,
+    user: dict = Depends(require_roles("translator", "reviewer")),
+):
+    """认领人提前释放认领。
+
+    - 自己持有有效认领 → 删除，返回释放结果；
+    - 当前无有效认领（已到期 / 已被修订等失效 / 从未认领）→ 幂等成功，不改变状态；
+    - 有效认领属于他人 → 403，不能代他人释放。
+    """
+    with db._write_lock, get_conn() as conn:
+        active = _get_active_claim(conn, language_id, label_id)
+        if active and active["claimer_id"] != user["id"]:
+            raise HTTPException(
+                403,
+                f"该译文由 {active['claimer_name']} 持有有效认领，不能代为释放",
+            )
+        conn.execute(
+            "DELETE FROM claims WHERE label_id = ? AND language_id = ?",
+            (label_id, language_id),
+        )
+        conn.commit()
+    return {"released": True, "language_id": language_id, "label_id": label_id}
 
 
 # ---------------------------- 发布不可变快照 ----------------------------

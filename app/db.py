@@ -88,6 +88,21 @@ CREATE TABLE IF NOT EXISTS snapshots (
     payload TEXT NOT NULL,           -- 不可变 JSON
     UNIQUE (language_id, version)
 );
+
+-- 待审译文认领：同一（语言, 展签）同一时刻至多一条；
+-- 到期（expires_at < 当前 UTC 时间）后视为无效，他人可接手（惰性清理）。
+-- 原文/译文修订、撤展、复展都会删除相关行；成功确认也删除对应行。
+CREATE TABLE IF NOT EXISTS claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    language_id INTEGER NOT NULL REFERENCES languages(id),
+    label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    claimer_id INTEGER NOT NULL REFERENCES users(id),
+    source_rev INTEGER NOT NULL,          -- 认领时读取的原文修订号
+    trans_rev INTEGER NOT NULL,           -- 认领时读取的译文修订号
+    claimed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE (language_id, label_id)
+);
 """
 
 
