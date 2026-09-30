@@ -315,13 +315,28 @@ function renderItem(item) {
       </div>`;
   }
 
+  // 认领信息（看板显示认领人与到期时间）
+  let claimHtml = '';
+  if (item.claim) {
+    const cl = item.claim;
+    const mine = isWorker() && cl.claimant_id === state.me.id;
+    claimHtml = `
+      <div class="claim-box ${mine ? 'mine' : ''}" data-expires="${esc(cl.expires_at)}">
+        🔒 <b>${esc(cl.claimant_name)}</b> 已认领该译文
+        （到期时间 ${esc(cl.expires_at)} UTC，剩余 <span class="claim-remain">${cl.remaining_seconds}</span> 秒）
+        ${mine
+          ? '<button class="small ghost release-claim">提前释放</button>'
+          : '<span class="muted">认领期间其他账号不能确认</span>'}
+      </div>`;
+  }
+
   // 操作区
   let actions = '';
   if (isWorker()) {
-    const canEdit = true; // 译者/校对均可提交译文
     const own = t && t.translator_id === state.me.id;
+    const claimedByOther = !!(item.claim && item.claim.claimant_id !== state.me.id);
     actions += `
-      <label>${t ? '修订译文（提交后译文修订号 +1、清除确认）' : '提交译文'}</label>
+      <label>${t ? '修订译文（提交后译文修订号 +1、清除确认与认领）' : '提交译文'}</label>
       <textarea class="t-edit" rows="2">${t ? esc(t.text) : ''}</textarea>
       <div class="row-actions">
         <button class="small submit-trans">${t ? '提交修订' : '提交译文'}</button>`;
@@ -332,9 +347,16 @@ function renderItem(item) {
       } else if (item.status === 'stale') {
         actions += `<span class="reason">译文基于旧版原文，须先提交修订后再确认。</span>`;
       } else if (own) {
-        actions += `<span class="muted">此译文由你提交，依规则须由另一名账号校对确认。</span>`;
+        actions += `<span class="muted">此译文由你提交，依规则须由另一名账号校对确认；你也不能认领自己的译文。</span>`;
+      } else if (claimedByOther) {
+        actions += `<span class="muted">已由 ${esc(item.claim.claimant_name)} 认领，请等待释放或到期。</span>`;
+      } else if (item.claim) {
+        // 本人持有认领：可直接确认
+        actions += `<button class="small ghost confirm-trans">确认译文（你的认领有效中）</button>`;
       } else {
-        actions += `<button class="small ghost confirm-trans">确认译文</button>`;
+        actions += `
+          <button class="small claim-trans">认领 30 分钟</button>
+          <button class="small ghost confirm-trans">直接确认（未认领时按原流程）</button>`;
       }
     }
     actions += '</div>';
@@ -353,6 +375,7 @@ function renderItem(item) {
     <div class="src">${esc(l.source_text)}</div>
     ${transHtml}
     <div class="reason ${item.status === 'ready' ? 'ok' : ''}">${esc(item.reason)}</div>
+    ${claimHtml}
     ${actions}
   </div>`;
 }
@@ -422,7 +445,43 @@ function bindItemEvents() {
             trans_rev: Number(box.dataset.transRev),
           }),
         });
-        toast('已确认');
+        toast('已确认，认领已结束');
+        await loadBoard();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }));
+
+  document.querySelectorAll('.claim-trans').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const box = btn.closest('.item');
+      btn.disabled = true;
+      try {
+        await api(`/api/board/${state.currentLangId}/labels/${box.dataset.label}/claim`, {
+          method: 'POST',
+          body: JSON.stringify({
+            source_rev: Number(box.dataset.sourceRev),
+            trans_rev: Number(box.dataset.transRev),
+          }),
+        });
+        toast('已认领 30 分钟：期间其他账号不能确认，可提前释放');
+        await loadBoard();
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }));
+
+  document.querySelectorAll('.release-claim').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const box = btn.closest('.item');
+      btn.disabled = true;
+      try {
+        await api(`/api/board/${state.currentLangId}/labels/${box.dataset.label}/claim/release`, {
+          method: 'POST',
+        });
+        toast('已提前释放认领，其他账号现在可认领或确认');
         await loadBoard();
       } catch (e) {
         toast(e.message, true);
@@ -430,6 +489,27 @@ function bindItemEvents() {
       }
     }));
 }
+
+// ---------------------------- 认领倒计时 ----------------------------
+
+state.tickReloading = false;
+setInterval(() => {
+  const boxes = document.querySelectorAll('.claim-box');
+  if (!boxes.length) return;
+  let anyExpired = false;
+  boxes.forEach((box) => {
+    const end = Date.parse(box.dataset.expires.replace(' ', 'T') + 'Z');
+    const remain = Math.max(0, Math.round((end - Date.now()) / 1000));
+    const el = box.querySelector('.claim-remain');
+    if (el) el.textContent = remain;
+    if (remain === 0) anyExpired = true;
+  });
+  // 有认领到期：刷新看板（加锁避免重复请求），使“可接手/可确认”状态即时更新
+  if (anyExpired && !state.tickReloading) {
+    state.tickReloading = true;
+    loadBoard().finally(() => { state.tickReloading = false; });
+  }
+}, 1000);
 
 // ---------------------------- 发布快照 ----------------------------
 
